@@ -14,13 +14,10 @@ specific language governing permissions and limitations
 under the License.
 """
 import time
-from typing import Iterable, Tuple, Union
+from typing import Iterable, Mapping, Union
 
 from gs_quant.api.risk import RiskApi
-from gs_quant.base import Priceable
-from gs_quant.markets.core import MarketDataCoordinate
-from gs_quant.risk import CoordinatesRequest, RiskRequest, PricingContext, \
-    LiquidityRequest, LiquidityResponse, RiskModelRequest
+from gs_quant.risk import RiskRequest, LiquidityRequest, LiquidityResponse, RiskModelRequest
 from gs_quant.session import GsSession
 
 
@@ -36,32 +33,25 @@ class GsRiskApi(RiskApi):
         return GsSession.current._post(r'/risk/calculate', request)
 
     @classmethod
-    def get_results(cls, risk_request: RiskRequest, result_id: str) -> dict:
+    def get_results(cls, ids_to_requests: Mapping[str, RiskRequest]) -> Mapping[str, dict]:
         session = GsSession.current
-        url = '/risk/calculate/{}/results'.format(result_id)
+        result_ids = tuple(ids_to_requests.keys())
+        num_results = len(result_ids)
+        urls = {i: '/risk/calculate/{}/results'.format(i) for i in result_ids}
         results = {}
 
-        while not results:
-            result = session._get(url)
+        while len(results) < num_results:
+            for result_id, url in urls.items():
+                if result_id in results:
+                    continue
 
-            if isinstance(result, list):
-                results = cls._handle_results(risk_request, result)
-            else:
-                time.sleep(1)
+                result = session._get(url)
+                if isinstance(result, list):
+                    results[result_id] = cls._handle_results(ids_to_requests[result_id], result)
+
+            time.sleep(1)
 
         return results
-
-    @classmethod
-    def coordinates(cls, priceables: Iterable[Priceable]) -> Tuple[MarketDataCoordinate, ...]:
-        coordinates_request = CoordinatesRequest(PricingContext.current.pricing_date, instruments=tuple(priceables))
-        response = GsSession.current._post(r'/risk/coordinates', coordinates_request)
-
-        return tuple(MarketDataCoordinate(
-            mkt_type=r.get('marketDataType'),
-            mkt_class=r.get('pointClass'),
-            mkt_point=tuple(r.get('marketDataPoint', r.get('point', '')).split('_')),
-            mkt_quoting_style=r.get('field', r.get('quotingStyle')))
-            for r in response)  # TODO use 'quotingStyle' after changing risk definition in slang
 
     @classmethod
     def liquidity(cls, request: LiquidityRequest) -> LiquidityResponse:

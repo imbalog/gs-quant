@@ -20,7 +20,7 @@ from typing import Iterable, Optional, Tuple, Union
 
 from gs_quant.base import Priceable
 from gs_quant.datetime.date import business_day_offset, date_range
-from gs_quant.target.risk import PricingDateAndMarketDataAsOf, RiskMeasure
+from gs_quant.risk import PricingDateAndMarketDataAsOf, RiskMeasure
 from .core import PricingCache, PricingContext
 
 
@@ -39,7 +39,9 @@ class HistoricalPricingContext(PricingContext):
             is_async: bool = False,
             is_batch: bool = False,
             use_cache: bool = False,
-            visible_to_gs: bool = False):
+            visible_to_gs: bool = False,
+            csa_term: str = None,
+            market_data_location: Optional[str] = None):
         """
         A context for producing valuations over multiple dates
 
@@ -52,6 +54,8 @@ class HistoricalPricingContext(PricingContext):
         It can be used with is_async=True|False (defaults to False)
         :param use_cache: store results in the pricing cache (defaults to False)
         :param visible_to_gs: are the contents of risk requests visible to GS (defaults to False)
+        :param csa_term: the csa under which the calculations are made. Default is local ccy ois index
+        :param market_data_location: the location for sourcing market data ('NYC', 'LDN' or 'HKG' (defaults to LDN)
 
         **Examples**
 
@@ -63,7 +67,8 @@ class HistoricalPricingContext(PricingContext):
         >>>
         >>> price_series = price_f.result()
         """
-        super().__init__(is_async=is_async, is_batch=is_batch, use_cache=use_cache, visible_to_gs=visible_to_gs)
+        super().__init__(is_async=is_async, is_batch=is_batch, use_cache=use_cache, visible_to_gs=visible_to_gs,
+                         csa_term=csa_term, market_data_location=market_data_location)
         self.__calc_dates = None
 
         if start is not None:
@@ -105,8 +110,8 @@ class HistoricalPricingContext(PricingContext):
     def calc(self, priceable: Priceable, risk_measure: Union[RiskMeasure, Iterable[RiskMeasure]])\
             -> Union[pd.DataFrame, pd.Series, Future]:
         if self.use_cache:
-            cached_dates = PricingCache.dates(priceable, self.market_data_location, risk_measure) or ()
-            calc_dates = set(self.__date_range).difference(cached_dates)
+            missing_keys = PricingCache.missing_pricing_keys(priceable, risk_measure, self.pricing_key) or ()
+            calc_dates = set(k.pricing_market_data_as_of[0].pricing_date for k in missing_keys)
             self.__calc_dates = calc_dates if self.__calc_dates is None else self.__calc_dates | calc_dates
 
         return super().calc(priceable, risk_measure)

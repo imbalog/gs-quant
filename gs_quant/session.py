@@ -108,15 +108,18 @@ class GsSession(ContextBase):
 
     def close(self):
         self._session: requests.Session
-        # don't close a shared adapter
-        if self.http_adapter is None:
-            self._session.close()
-        self._session = None
+
+        if self._session:
+            # don't close a shared adapter
+            if self.http_adapter is None:
+                self._session.close()
+            self._session = None
 
     def __del__(self):
         self.close()
 
-    def __unpack(self, results: Union[dict, list], cls: type) -> Union[Base, tuple, dict]:
+    @staticmethod
+    def __unpack(results: Union[dict, list], cls: type) -> Union[Base, tuple, dict]:
         if issubclass(cls, Base):
             if isinstance(results, list):
                 return tuple(None if r is None else cls.from_dict(r) for r in results)

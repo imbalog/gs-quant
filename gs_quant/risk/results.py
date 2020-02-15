@@ -13,10 +13,10 @@ KIND, either express or implied.  See the License for the
 specific language governing permissions and limitations
 under the License.
 """
-from gs_quant.priceable import RiskResult
-from gs_quant.instrument import Instrument
-from gs_quant.risk import RiskMeasure, aggregate_results
+from gs_quant.base import Priceable
+from gs_quant.risk import RiskMeasure, RiskResult, aggregate_results
 
+from collections import namedtuple
 from concurrent.futures import Future
 from functools import partial
 from itertools import chain
@@ -24,11 +24,14 @@ import pandas as pd
 from typing import Iterable, Mapping, Optional, Tuple, Union
 
 
+MeasureResult = namedtuple('MeasureResult', ('value', 'error', 'unit', 'pricing_key'))
+
+
 class CompositeResultFuture:
 
-    def __init__(self, futures: Iterable[Future]):
+    def __init__(self, futures: Iterable[Future], result_future: Optional[Future] = None):
         self._futures = tuple(futures)
-        self._result_future = Future()
+        self._result_future = result_future or Future()
         self.__pending = set(range(len(self._futures)))
 
         for idx, future in enumerate(futures):
@@ -36,6 +39,9 @@ class CompositeResultFuture:
                 self.__pending.remove(idx)
             else:
                 future.add_done_callback(partial(self.__cb, idx=idx))
+
+    def __getitem__(self, item):
+        return self.result()[item]
 
     def __cb(self, _future: Future, idx):
         self.__pending.remove(idx)
@@ -59,17 +65,19 @@ class CompositeResultFuture:
         self._result_future.add_done_callback(fn)
 
 
+class MultipleRiskMeasureResult(dict):
+    pass
+
+
 class MultipleRiskMeasureFuture(CompositeResultFuture):
 
-    def __init__(self, measures_to_futures: Mapping[RiskMeasure, Future]):
-        super().__init__(measures_to_futures.values())
+    def __init__(self, measures_to_futures: Mapping[RiskMeasure, Future], result_future: Optional[Future] = None):
+        super().__init__(measures_to_futures.values(), result_future=result_future)
         self.__risk_measures = measures_to_futures.keys()
 
-    def __getitem__(self, item):
-        return self.result()[item]
-
     def _set_result(self):
-        self._result_future.set_result(dict(zip(self.__risk_measures, (f.result() for f in self.futures))))
+        self._result_future.set_result(MultipleRiskMeasureResult(
+            dict(zip(self.__risk_measures, (f.result() for f in self.futures)))))
 
 
 class PortfolioRiskResult(RiskResult):
@@ -77,8 +85,9 @@ class PortfolioRiskResult(RiskResult):
     def __init__(self,
                  portfolio,
                  risk_measures: Iterable[RiskMeasure],
-                 futures: Iterable[Future]):
-        super().__init__(CompositeResultFuture(futures), tuple(risk_measures))
+                 futures: Iterable[Future],
+                 result_future: Optional[Future] = None):
+        super().__init__(CompositeResultFuture(futures, result_future=result_future), tuple(risk_measures))
         self.__portfolio = portfolio
 
     def __getitem__(self, item):
@@ -86,7 +95,10 @@ class PortfolioRiskResult(RiskResult):
             if item not in self.risk_measures:
                 raise ValueError('{} not computed'.format(item))
 
-            return PortfolioRiskResult(self.__portfolio, (item,), self._result.futures)
+            if len(self.risk_measures) == 1:
+                return self
+            else:
+                return PortfolioRiskResult(self.__portfolio, (item,), self._result.futures)
         else:
             return self.__results(instruments=item)
 
@@ -97,37 +109,40 @@ class PortfolioRiskResult(RiskResult):
         return iter(self.__results())
 
     def subset(self,
-               instruments: Optional[Iterable[Union[int, str, Instrument]]]):
+               instruments: Optional[Iterable[Union[int, str, Priceable]]]):
         return PortfolioRiskResult(self.__portfolio, self.risk_measures, self.__futures(instruments))
 
     def aggregate(self) -> Union[float, pd.DataFrame, pd.Series]:
         return aggregate_results(self.__results())
 
     def __futures(self,
-                  instruments: Optional[Union[int, slice, str, Instrument, Iterable[Union[int, str, Instrument]]]]) ->\
+                  instruments: Optional[Union[int, slice, str, Priceable, Iterable[Union[int, str, Priceable]]]]) ->\
             Union[Future, Tuple[Future, ...]]:
         futures = self._result.futures
-        scalar = True
 
-        if isinstance(instruments, int):
-            futures = (futures[instruments],)
-        elif isinstance(instruments, slice):
-            futures = futures[instruments]
-        elif isinstance(instruments, (str, Instrument)):
-            idx = self.__portfolio.index(instruments)
-            if isinstance(idx, int):
-                futures = (futures[idx],)
+        if isinstance(instruments, (int, slice)):
+            return futures[instruments]
+        elif isinstance(instruments, (str, Priceable)):
+            idx = None
+
+            try:
+                idx = self.__portfolio.index(instruments)
+            except KeyError:
+                # See if we have priced then resolved
+                if isinstance(instruments, Priceable) and instruments.unresolved:
+                    idx = self.__portfolio.index(instruments.unresolved)
+
+            if idx is None:
+                raise KeyError('Instrument not in portfolio')
+            elif isinstance(idx, int):
+                return futures[idx]
             else:
-                scalar = False
-                futures = tuple(futures[i] for i in idx)
+                return tuple(futures[i] for i in idx)
         else:
-            scalar = False
-            futures = tuple(chain.from_iterable(self.__futures(i) for i in instruments))
-
-        return next(iter(futures)) if scalar else futures
+            return tuple(chain.from_iterable(self.__futures(i) for i in instruments))
 
     def __results(self,
-                  instruments: Optional[Union[int, slice, str, Instrument, Iterable[Union[int, str, Instrument]]]] = (),
+                  instruments: Optional[Union[int, slice, str, Priceable, Iterable[Union[int, str, Priceable]]]] = (),
                   risk_measure: Optional[RiskMeasure] = None):
         futures = self.__futures(instruments) if instruments or instruments == 0 else self._result.futures
         scalar = isinstance(futures, (Future, MultipleRiskMeasureFuture))
@@ -135,6 +150,7 @@ class PortfolioRiskResult(RiskResult):
 
         def result(future: Future):
             res = future.result()
-            return res[risk_measure] if risk_measure and isinstance(res, (dict, MultipleRiskMeasureFuture)) else res
+            return res[risk_measure] if risk_measure and\
+                isinstance(res, (MultipleRiskMeasureResult, MultipleRiskMeasureFuture)) else res
 
         return result(futures) if scalar else tuple(result(f) for f in futures)

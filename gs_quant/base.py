@@ -15,6 +15,7 @@ under the License.
 """
 from abc import ABCMeta
 import builtins
+from collections import namedtuple
 import copy
 import datetime as dt
 import dateutil
@@ -26,6 +27,7 @@ import keyword
 import logging
 from typing import Union, get_type_hints
 
+from gs_quant.context_base import ContextBase, ContextMeta
 
 _logger = logging.getLogger(__name__)
 
@@ -59,6 +61,29 @@ def camel_case_translate(f):
         return f(*args, **normalised_kwargs)
 
     return wrapper
+
+
+class PricingKey(
+    namedtuple('_PricingKey', ('pricing_market_data_as_of', 'market_data_location', 'parameters', 'scenario'))
+):
+
+    def __iter__(self):
+        if len(self.pricing_market_data_as_of) > 1:
+            return iter(self.clone(pricing_market_data_as_of=(as_of,)) for as_of in self.pricing_market_data_as_of)
+        else:
+            return iter([self])
+
+    def clone(self, **kwargs):
+        dict = {f: getattr(self, f, None) for f in super()._fields}
+        dict.update(kwargs)
+        return PricingKey(**dict)
+
+    def for_pricing_date(self, pricing_date: dt.date):
+        as_of = next((a for a in self.pricing_market_data_as_of if a.pricing_date == pricing_date), None)
+        if as_of is None:
+            raise ValueError('{} not found'.format(pricing_date))
+
+        return self.clone(pricing_market_data_as_of=(as_of,))
 
 
 class EnumBase:
@@ -164,7 +189,8 @@ class Base(metaclass=ABCMeta):
         """The public property names of this class"""
         if not cls.__properties:
             cls.__properties = set(i for i in dir(cls) if isinstance(getattr(cls, i), property)
-                                   and not i.startswith('_'))
+                                   and not i.startswith('_') and not
+                                   getattr(getattr(cls, i).fget, 'do_not_serialise', False))
         return cls.__properties
 
     def as_dict(self, as_camel_case: bool=False) -> dict:
@@ -278,13 +304,27 @@ class Base(metaclass=ABCMeta):
         return cls._from_dict(values)
 
     @classmethod
-    def default_instance(cls) -> 'Base':
+    def default_instance(cls):
         """
         Construct a default instance of this type
         """
         args = [k for k, v in signature(cls.__init__).parameters.items() if v.default == Parameter.empty][1:]
         required = {a: None for a in args}
         return cls(**required)
+
+    def from_instance(self, instance):
+        """
+        Copy the values from an existing instance of the same type to our self
+        :param instance: from which to copy:
+        :return:
+        """
+        if not isinstance(instance, type(self)):
+            raise ValueError('Can only use from_instance with an object of the same type')
+
+        for prop in self.properties():
+            attr = getattr(super().__getattribute__('__class__'), prop)
+            if attr.fset:
+                super(Base, self).__setattr__(prop, super(Base, instance).__getattribute__(prop))
 
 
 class Priceable(Base, metaclass=ABCMeta):
@@ -345,7 +385,7 @@ class Priceable(Base, metaclass=ABCMeta):
         >>> cap_usd = IRCap('1y', 'USD')
         >>> cap_eur = IRCap('1y', 'EUR')
         >>>
-        >>> from gs_quant.risk import PricingContext
+        >>> from gs_quant.markets import PricingContext
         >>>
         >>> with PricingContext():
         >>>     price_usd_f = cap_usd.dollar_price()
@@ -399,7 +439,7 @@ class Priceable(Base, metaclass=ABCMeta):
 
         delta is a float
 
-        >>> from gs_quant.risk import PricingContext
+        >>> from gs_quant.markets import PricingContext
         >>>
         >>> cap_usd = IRCap('1y', 'USD')
         >>> cap_eur = IRCap('1y', 'EUR')
@@ -414,6 +454,18 @@ class Priceable(Base, metaclass=ABCMeta):
         usd_delta_f and eur_delta_f are futures, usd_delta and eur_delta are dataframes
         """
         raise NotImplementedError
+
+
+class __ScenarioMeta(ABCMeta, ContextMeta):
+    pass
+
+
+class Scenario(Base, ContextBase, metaclass=__ScenarioMeta):
+    pass
+
+
+class InstrumentBase(Base):
+    pass
 
 
 def get_enum_value(enum_type: EnumMeta, value: Union[EnumBase, str]):

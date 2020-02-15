@@ -15,11 +15,12 @@ under the License.
 """
 
 import datetime as dt
+import threading
 from abc import ABCMeta, abstractmethod
 from enum import Enum
-from typing import Tuple, Optional
-from typing import Union
+from typing import Callable, Optional, Tuple, Union
 
+import cachetools
 import pytz
 
 from gs_quant.api.gs.assets import GsAssetApi, GsAsset, AssetClass, AssetType as GsAssetType, PositionSet
@@ -71,6 +72,9 @@ class AssetType(Enum):
     #: Currency
     CURRENCY = "Currency"
 
+    #: Rate
+    RATE = "Rate"
+
 
 class AssetIdentifier(Enum):
     """Asset type enumeration
@@ -121,11 +125,11 @@ class Asset(metaclass=ABCMeta):
 
         Get identifiers as of 1Jan18:
 
-        >>> gs.get_identifiers(date(2018,1,1))
+        >>> gs.get_identifiers(dt.date(2018,1,1))
 
         Use PricingContext to determine as of date:
 
-        >>> with PricingContext(date(2018,1,1)) as ctx:
+        >>> with PricingContext(dt.date(2018,1,1)) as ctx:
         >>>     gs.get_identifiers()
 
         **See also**
@@ -153,6 +157,9 @@ class Asset(metaclass=ABCMeta):
 
         return identifiers
 
+    @cachetools.cached(cachetools.TTLCache(256, 600),
+                       lambda s, id_type, as_of=None: cachetools.keys.hashkey(s.get_marquee_id(), id_type, as_of),
+                       threading.RLock())
     def get_identifier(self, id_type: AssetIdentifier, as_of: dt.date = None):
         """
         Get asset identifier
@@ -171,16 +178,18 @@ class Asset(metaclass=ABCMeta):
 
         Get current SEDOL:
 
+        >>> import datetime as dt
+        >>>
         >>> gs = SecurityMaster.get_asset("GS", AssetIdentifier.TICKER)
         >>> gs.get_identifier(AssetIdentifier.SEDOL)
 
         Get SEDOL as of 1Jan18:
 
-        >>> gs.get_identifier(AssetIdentifier.SEDOL, as_of=date(2018,1,1))
+        >>> gs.get_identifier(AssetIdentifier.SEDOL, as_of=dt.date(2018,1,1))
 
         Use PricingContext to determine as of date:
 
-        >>> with PricingContext(date(2018,1,1)) as ctx:
+        >>> with PricingContext(dt.date(2018,1,1)) as ctx:
         >>>     gs.get_identifier(AssetIdentifier.SEDOL)
 
         **See also**
@@ -260,6 +269,21 @@ class Currency(Asset):
         return AssetType.CURRENCY
 
 
+class Rate(Asset):
+    """Base Security Type
+
+    Represents a financial asset which can be held in a portfolio, or has an observable price fixing which can be
+    referenced in a derivative transaction
+
+    """
+
+    def __init__(self, id_: str, name: str):
+        Asset.__init__(self, id_, AssetClass.Rates, name)
+
+    def get_type(self) -> AssetType:
+        return AssetType.RATE
+
+
 class IndexConstituentProvider(metaclass=ABCMeta):
     def __init__(self, id_: str):
         self.__id = id_
@@ -282,16 +306,18 @@ class IndexConstituentProvider(metaclass=ABCMeta):
 
         Get current index constituents (defaults to close):
 
-        >>> gs = SecurityMaster.get_asset("GSTHHVIP", AssetIdentifier.TICKER)
+        >>> import datetime as dt
+        >>>
+        >>> gs = SecurityMaster.get_asset('GSTHHVIP', AssetIdentifier.TICKER)
         >>> gs.get_constituents()
 
         Get constituents as of market open on 3Jan18:
 
-        >>> gs.get_constituents(date(2018,1,3), PositionType.OPEN)
+        >>> gs.get_constituents(dt.date(2018,1,3), PositionType.OPEN)
 
         Use PricingContext to determine as of date:
 
-        >>> with PricingContext(date(2018,1,1)) as ctx:
+        >>> with PricingContext(dt.date(2018,1,1)) as ctx:
         >>>     gs.get_constituents()
 
         **See also**
@@ -397,6 +423,9 @@ class SecurityMaster:
         if asset_type in (GsAssetType.Currency.value,):
             return Currency(gs_asset.id, gs_asset.name)
 
+        if asset_type in (GsAssetType.Rate.value,):
+            return Rate(gs_asset.id, gs_asset.name)
+
         raise TypeError(f'unsupported asset type {asset_type}')
 
     @classmethod
@@ -408,6 +437,7 @@ class SecurityMaster:
             AssetType.ETF: (GsAssetType.ETF, GsAssetType.ETN),
             AssetType.BASKET: (GsAssetType.Custom_Basket, GsAssetType.Research_Basket),
             AssetType.FUTURE: (GsAssetType.Future,),
+            AssetType.RATE: (GsAssetType.Rate,),
         }
 
         return asset_map.get(asset_type)
@@ -418,7 +448,8 @@ class SecurityMaster:
                   id_type: AssetIdentifier,
                   as_of: Union[dt.date, dt.datetime] = None,
                   exchange_code: ExchangeCode = None,
-                  asset_type: AssetType = None) -> Asset:
+                  asset_type: AssetType = None,
+                  key: Optional[Callable] = None) -> Asset:
         """
         Get an asset by identifier and identifier type
 
@@ -427,12 +458,14 @@ class SecurityMaster:
         :param exchange_code: exchange code
         :param asset_type: asset type
         :param as_of: As of date for query
+        :param key: key function to sort assets
         :return: Asset object or None
 
         **Usage**
 
         Get asset object using a specified identifier and identifier type. Where the identifiers are temporal (and can
-        change over time), will use the current MarketContext to evaluate based on the specified date.
+        change over time), will use the current MarketContext to evaluate based on the specified date. If multiple
+        assets are found, the first one is returned (caller can provide a key function to sort them).
 
         **Examples**
 
@@ -474,6 +507,8 @@ class SecurityMaster:
             query['type'] = [t.value for t in cls.__asset_type_to_gs_types(asset_type)]
 
         results = GsAssetApi.get_many_assets(as_of=as_of, **query)
+        if key is not None:
+            results = sorted(results, key=key)
         result = next(iter(results), None)
 
         if result:

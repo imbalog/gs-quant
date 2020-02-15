@@ -17,21 +17,53 @@ from abc import ABCMeta
 from concurrent.futures import Future, ThreadPoolExecutor
 import copy
 import datetime as dt
-import functools
-import inflection
+import itertools
 import logging
-import pandas as pd
+from threading import Lock
 from typing import Iterable, Optional, Tuple, Union
 import weakref
 
-from gs_quant.base import Priceable
+from gs_quant.api.risk import RiskApi
+from gs_quant.base import Priceable, PricingKey, Scenario
 from gs_quant.context_base import ContextBaseWithDefault
-from gs_quant.datetime.date import business_day_offset
+from gs_quant.datetime.date import business_day_offset, is_business_day
+from gs_quant.risk import DataFrameWithInfo, ErrorValue, FloatWithInfo, MarketDataScenario,\
+    PricingDateAndMarketDataAsOf,\
+    ResolvedInstrumentValues, RiskMeasure, RiskPosition, RiskRequest,\
+    RiskRequestParameters, SeriesWithInfo
+from gs_quant.risk.results import MultipleRiskMeasureFuture
 from gs_quant.session import GsSession
-from gs_quant.target.common import MarketDataCoordinate as __MarketDataCoordinate
-from gs_quant.target.risk import PricingDateAndMarketDataAsOf, RiskMeasure, RiskPosition, RiskRequest
+from gs_quant.target.data import MarketDataCoordinate as __MarketDataCoordinate
+
 
 _logger = logging.getLogger(__name__)
+
+
+class PricingFuture(Future):
+
+    def __init__(self, pricing_context):
+        super().__init__()
+        self.__pricing_context = pricing_context
+
+    def result(self, timeout=None):
+        """Return the result of the call that the future represents.
+
+        :param timeout: The number of seconds to wait for the result if the future isn't done.
+        If None, then there is no limit on the wait time.
+
+        Returns:
+            The result of the call that the future represents.
+
+        Raises:
+            CancelledError: If the future was cancelled.
+            TimeoutError: If the future didn't finish executing before the given timeout.
+
+        Exception: If the call raised then that exception will be raised.
+        """
+        if not self.done() and PricingContext.current == self.__pricing_context and self.__pricing_context.is_entered:
+            raise RuntimeError('Cannot evaluate results under the same pricing context being used to produce them')
+
+        return super().result(timeout=timeout)
 
 
 class MarketDataCoordinate(__MarketDataCoordinate):
@@ -52,53 +84,48 @@ class PricingCache(metaclass=ABCMeta):
         __cache = weakref.WeakKeyDictionary()
 
     @classmethod
-    def dates(cls,
-              priceable: Priceable,
-              location: str,
-              risk_measure: RiskMeasure) -> Tuple[dt.date, ...]:
-        if priceable in cls.__cache and (location, risk_measure) in cls.__cache[priceable]:
-            return tuple(sorted(cls.__cache[priceable][(location, risk_measure)].keys()))
+    def missing_pricing_keys(cls,
+                             priceable: Priceable,
+                             risk_measure: RiskMeasure,
+                             pricing_key: Optional[PricingKey] = None) -> Tuple[PricingKey, ...]:
+        pricing_key = pricing_key or PricingContext.current.pricing_key
+
+        if priceable in cls.__cache and risk_measure in cls.__cache[priceable]:
+            cached = cls.__cache[priceable][risk_measure]
+            return tuple(k for k in pricing_key if k not in cached)
+        else:
+            return pricing_key
 
     @classmethod
     def get(cls,
             priceable: Priceable,
-            location: str,
             risk_measure: RiskMeasure,
-            dates: Union[dt.date, Iterable[dt.date]]):
-        if priceable not in cls.__cache or (location, risk_measure) not in cls.__cache[priceable]:
+            pricing_key: Optional[PricingKey] = None,
+            return_partial: bool = False) -> Optional[Union[DataFrameWithInfo, FloatWithInfo, SeriesWithInfo]]:
+        if priceable not in cls.__cache or risk_measure not in cls.__cache[priceable]:
             return
 
-        results = cls.__cache[priceable][(location, risk_measure)]
+        pricing_key = pricing_key or PricingContext.current.pricing_key
+        cached = cls.__cache[priceable][risk_measure]
 
-        if not results:
-            return None
-        elif isinstance(dates, dt.date):
-            return results.get(dates)
+        if len(pricing_key.pricing_market_data_as_of) > 1:
+            values = [cached[k] for k in pricing_key if k in cached]
+            if values and (return_partial or len(values) == len(pricing_key.pricing_market_data_as_of)):
+                return values[0].compose(values, pricing_key)
         else:
-            if isinstance(next(iter(results.values())), pd.DataFrame):
-                dfs = [results[date].assign(date=date) for date in dates if date in results]
-                ret = pd.concat(dfs)
-                return ret.set_index('date')
-            else:
-                ret = pd.Series({date: results[date] for date in dates if date in results})
-                return ret.sort_index()
+            return cached.get(pricing_key)
 
     @classmethod
     def put(cls,
             priceable: Priceable,
-            location: str,
             risk_measure: RiskMeasure,
-            result: Union[float, str, pd.DataFrame, pd.Series]):
-        cache_results = {}
+            result: Union[DataFrameWithInfo, FloatWithInfo, SeriesWithInfo],
+            pricing_key: Optional[PricingKey] = None):
+        pricing_key = pricing_key or PricingContext.current.pricing_key
 
-        if isinstance(result, pd.Series):
-            cache_results = dict(zip(result.index.unique(), (result.loc[d] for d in result.index.values)))
-        elif isinstance(result, pd.DataFrame) and len(result.index.values):
-            cache_results = dict(zip(result.index.unique(), (result.loc[d].reset_index(drop=True) for d in result.index.values)))
-        else:
-            cache_results[PricingContext.current.pricing_date] = result
-
-        cls.__cache.setdefault(priceable, {}).setdefault((location, risk_measure), {}).update(cache_results)
+        if isinstance(result, (DataFrameWithInfo, FloatWithInfo, SeriesWithInfo)):
+            cls.__cache.setdefault(priceable, {}).setdefault(risk_measure, {}).update(
+                {k: result.for_pricing_key(k) for k in pricing_key})
 
     @classmethod
     def drop(cls, priceable: Priceable):
@@ -119,7 +146,9 @@ class PricingContext(ContextBaseWithDefault):
                  is_async: bool = False,
                  is_batch: bool = False,
                  use_cache: bool = False,
-                 visible_to_gs: bool = False):
+                 visible_to_gs: bool = False,
+                 csa_term: Optional[str] = None
+                 ):
         """
         The methods on this class should not be called directly. Instead, use the methods on the instruments,
         as per the examples
@@ -133,12 +162,13 @@ class PricingContext(ContextBaseWithDefault):
         It can be used with is_aync=True|False (defaults to False)
         :param use_cache: store results in the pricing cache (defaults to False)
         :param visible_to_gs: are the contents of risk requests visible to GS (defaults to False)
+        :param csa_term: the csa under which the calculations are made. Default is local ccy ois index
 
         **Examples**
 
         To change the market data location of the default context:
 
-        >>> from gs_quant.risk import PricingContext
+        >>> from gs_quant.markets import PricingContext
         >>> import datetime as dt
         >>>
         >>> PricingContext.current = PricingContext(market_data_location='LDN')
@@ -156,109 +186,173 @@ class PricingContext(ContextBaseWithDefault):
         For an asynchronous request:
 
         >>> with PricingContext(is_async=True):
-        >>>     price_f = inst.dollar_price()
+        >>>     price_f = cap.dollar_price()
         >>>
-        >>> while not price_f.done():
+        >>> while not price_f.done:
         >>>     ...
         """
         super().__init__()
-        self.__pricing_date = pricing_date or dt.date.today()
+
+        if pricing_date is None:
+            pricing_date = dt.date.today()
+            while not is_business_day(pricing_date):
+                pricing_date -= dt.timedelta(days=1)
+
+        self.__pricing_date = pricing_date
+        self.__csa_term = csa_term
         self.__market_data_as_of = market_data_as_of
         self.__market_data_location = market_data_location or (
             self.__class__.current.market_data_location if self.__class__.default_is_set else 'LDN')
         self.__is_async = is_async
         self.__is_batch = is_batch
-        self.__risk_measures_by_provider_and_position = {}
+        self.__risk_measures_in_scenario_by_provider_and_position = {}
         self.__futures = {}
         self.__use_cache = use_cache
         self.__visible_to_gs = visible_to_gs
+        self.__lock = Lock()
 
     def _on_exit(self, exc_type, exc_val, exc_tb):
         self._calc()
 
     def _calc(self):
-        from gs_quant.risk import ScenarioContext
+        requests_by_provider = {}
+        session = GsSession.current
+        batch_result = Future() if self.__is_batch else None
 
-        def run_request(request: RiskRequest, session: GsSession):
-            calc_result = {}
-
+        def run_request(request_: RiskRequest, provider_: RiskApi):
             try:
                 with session:
-                    calc_result = provider.calc(request)
+                    handle_results(provider_.calc(request_), request_, provider_)
             except Exception as e:
-                for risk_measure in request.measures:
-                    measure_results = {}
-                    for result_position in risk_request.positions:
-                        measure_results[result_position] = str(e)
+                _logger.error(str(e))
+                handle_results(e, request_, provider_)
 
-                    calc_result[risk_measure] = measure_results
-            finally:
-                self._handle_results(calc_result)
+        def get_batch_results_if_ready(provider_: RiskApi):
+            def get_results():
+                with self.__lock:
+                    provider_requests = {v: k for k, v in requests_by_provider[provider_].items()}
 
-        from gs_quant.api.risk import RiskApi
+                try:
+                    with session:
+                        return provider_.get_results(provider_requests), provider_requests, provider_
+                except Exception as e:
+                    _logger.error(str(e))
+                    return e, provider_requests, provider_
 
-        def get_batch_results(request: RiskRequest, session: GsSession,
-                              batch_provider: RiskApi, batch_result_id: str):
-            with session:
-                results = batch_provider.get_results(request, batch_result_id)
-            self._handle_results(results)
+            with self.__lock:
+                ready = all(v for k, v in requests_by_provider[provider_].items())
 
-        batch_results = []
-        pool = ThreadPoolExecutor(len(self.__risk_measures_by_provider_and_position)) if self.__is_async else None
-
-        while self.__risk_measures_by_provider_and_position:
-            provider, risk_measures_by_position = self.__risk_measures_by_provider_and_position.popitem()
-            positions_by_risk_measures = {}
-            for position, risk_measures in risk_measures_by_position.items():
-                positions_by_risk_measures.setdefault(tuple(risk_measures), []).append(position)
-
-            for risk_measures, positions in positions_by_risk_measures.items():
-                risk_request = RiskRequest(
-                    tuple(positions),
-                    tuple(sorted(risk_measures, key=lambda m: m.name or m.measure_type)),
-                    wait_for_results=not self.__is_batch,
-                    pricing_location=self.market_data_location,
-                    scenario=ScenarioContext.current if ScenarioContext.current.scenario is not None else None,
-                    pricing_and_market_data_as_of=self._pricing_market_data_as_of,
-                    request_visible_to_gs=self.__visible_to_gs
-                )
-
-                if self.__is_batch:
-                    batch_results.append((provider, risk_request, provider.calc(risk_request)))
-                elif pool:
-                    pool.submit(run_request, risk_request, GsSession.current)
+            if ready:
+                # All requests have been submitted, schedule result retrieval
+                if self.__is_async:
+                    batch_result_pool = ThreadPoolExecutor(1)
+                    batch_result_pool.submit(get_results).add_done_callback(lambda f: handle_results(*f.result()))
+                    batch_result_pool.shutdown(wait=False)
                 else:
-                    run_request(risk_request, GsSession.current)
+                    handle_results(*get_results())
 
-        for provider, risk_request, result_id in batch_results:
-            if pool:
-                pool.submit(get_batch_results, risk_request, GsSession.current, provider, result_id)
-            else:
-                get_batch_results(risk_request, GsSession.current, provider, result_id)
+        def handle_results(result: Union[Exception, dict, str], request_: RiskRequest, provider_: RiskApi):
+            if isinstance(result, Exception):
+                # Set all the futures for this request to an error value
+                self._handle_results({}, request_, str(result))
+                if not request_.wait_for_results:
+                    # If it's a batch request check whether this was the last outstanding an retrieve results
+                    # for any not in error, if so
+                    get_batch_results_if_ready(provider_)
+            elif isinstance(result, str):
+                # It's a result id from a batch request, add it to the dict until we've received all we're expecting
+                with self.__lock:
+                    requests_by_provider[provider_][request_] = result
+                get_batch_results_if_ready(provider_)
+            elif isinstance(result, dict):
+                if isinstance(request_, dict):
+                    # Batch response results, handle each result ...
+                    for result_id, sub_result in result.items():
+                        self._handle_results(sub_result, request_[result_id])
 
-        if pool:
-            pool.shutdown(wait=not self.__is_async)
+                    # ... and signal completion
+                    batch_result.set_result(True)
+                else:
+                    # A normal response
+                    self._handle_results(result, request_)
 
-    def _handle_results(self, results: dict):
-        for risk_measure, position_results in results.items():
-            for position, result in position_results.items():
-                if self.__use_cache:
-                    PricingCache.put(position.instrument, self.market_data_location, risk_measure, result)
-                    result = PricingCache.get(position.instrument, self.market_data_location, risk_measure, self.pricing_date)
+        with self.__lock:
+            # Group requests by risk_measures, positions, scenario - so we can create unique RiskRequest objects
+            # Determine how many we will need
+            while self.__risk_measures_in_scenario_by_provider_and_position:
+                provider, risk_measures_by_scenario =\
+                    self.__risk_measures_in_scenario_by_provider_and_position.popitem()
+                positions_by_scenario_and_risk_measures = {}
+                for position, scenario_to_risk_measures in risk_measures_by_scenario.items():
+                    for scenario, risk_measures in scenario_to_risk_measures.items():
+                        positions_by_scenario_and_risk_measures.setdefault(scenario, {}).setdefault(
+                            tuple(risk_measures), []).append(position)
 
-                positions_for_measure = self.__futures[risk_measure]
-                positions_for_measure.pop(position).set_result(result)
+                for scenario, positions_by_risk_measures in positions_by_scenario_and_risk_measures.items():
+                    for risk_measures, positions in positions_by_risk_measures.items():
+                        request = RiskRequest(
+                            tuple(positions),
+                            tuple(sorted(risk_measures, key=lambda m: m.name or m.measure_type.value)),
+                            parameters=self.__parameters,
+                            wait_for_results=not self.__is_batch,
+                            pricing_location=self.__market_data_location,
+                            scenario=scenario,
+                            pricing_and_market_data_as_of=self._pricing_market_data_as_of,
+                            request_visible_to_gs=self.__visible_to_gs
+                        )
+
+                        requests_by_provider.setdefault(provider, {})[request] = None
+
+        # We can't use asyncio here until we move to an async HTTP client
+        num_requests = len(tuple(itertools.chain.from_iterable(requests_by_provider.values())))
+        request_pool = ThreadPoolExecutor(num_requests) if num_requests > 1 or self.__is_async else None
+
+        for provider, requests in requests_by_provider.items():
+            for request in requests.keys():
+                if request_pool:
+                    request_pool.submit(run_request, request, provider)
+                else:
+                    run_request(request, provider)
+
+        if request_pool:
+            request_pool.shutdown(wait=not self.__is_async)
+
+        if batch_result and not self.__is_async:
+            batch_result.result()
+
+    def _handle_results(self, results: dict, request: RiskRequest, error: Optional[str] = 'No result returned'):
+        with self.__lock:
+            for risk_measure in request.measures:
+                # Get each risk measure from from the request and the corresponding positions --> futures dict
+                positions_for_measure = self.__futures[(request.scenario, risk_measure)]
+
+                # Get the results for this measure
+                position_results = results.pop(risk_measure, {})
+
+                for position in request.positions:
+                    # Set the result for this position to the returned value or an error if missing
+                    result = position_results.get(position, ErrorValue(self.pricing_key, error=error))
+                    if self.__use_cache and not isinstance(result, ErrorValue):
+                        # Populate the cache
+                        PricingCache.put(position.instrument, risk_measure, result)
+
+                        # Retrieve from the cache - this is used by HistoricalPricingContext. We ensure the cache has
+                        # all values (in case some had already been computed) then populate the result as the final step
+                        result = PricingCache.get(position.instrument, risk_measure)
+
+                    # Set the result for the future
+                    positions_for_measure.pop(position).set_result(result)
 
                 if not positions_for_measure:
-                    self.__futures.pop(risk_measure)
+                    self.__futures.pop((request.scenario, risk_measure))
 
-        # Now set an error string for any futures for which results were not returned
-        result = 'Error: no value returned'
-        while self.__futures:
-            _, positions_for_measure = self.__futures.popitem()
-            while positions_for_measure:
-                _, future = positions_for_measure.popitem()
-                future.set_result(result)
+    @property
+    def __parameters(self) -> RiskRequestParameters:
+        return RiskRequestParameters(self.__csa_term)
+
+    @property
+    def __scenario(self) -> MarketDataScenario:
+        return MarketDataScenario(scenario=Scenario.current) if Scenario.current_is_set else None
 
     @property
     def _pricing_market_data_as_of(self) -> Tuple[PricingDateAndMarketDataAsOf, ...]:
@@ -294,8 +388,18 @@ class PricingContext(ContextBaseWithDefault):
         """Request contents visible to GS"""
         return self.__visible_to_gs
 
+    @property
+    def pricing_key(self) -> PricingKey:
+        """A key representing information about the pricing environment"""
+        return PricingKey(
+            self._pricing_market_data_as_of,
+            self.__market_data_location,
+            self.__parameters,
+            self.__scenario)
+
     def calc(self, priceable: Priceable, risk_measure: Union[RiskMeasure, Iterable[RiskMeasure]])\
-            -> Union[dict, float, str, pd.DataFrame, pd.Series, Future]:
+            -> Union[list, DataFrameWithInfo, ErrorValue, FloatWithInfo, Future, MultipleRiskMeasureFuture,
+                     SeriesWithInfo]:
         """
         Calculate the risk measure for the priceable instrument. Do not use directly, use via instruments
 
@@ -311,34 +415,34 @@ class PricingContext(ContextBaseWithDefault):
         >>> swap = IRSwap('Pay', '10y', 'USD', fixed_rate=0.01)
         >>> delta = swap.calc(IRDelta)
         """
-        from gs_quant.risk.results import MultipleRiskMeasureFuture
-
         position = RiskPosition(priceable, priceable.get_quantity())
         multiple_measures = not isinstance(risk_measure, RiskMeasure)
         futures = {}
 
-        for measure in risk_measure if multiple_measures else (risk_measure,):
-            measure_future = self.__futures.get(measure, {}).get(position)
+        with self.__lock:
+            for measure in risk_measure if multiple_measures else (risk_measure,):
+                scenario = self.__scenario
+                measure_future = self.__futures.get((scenario, measure), {}).get(position)
 
-            if measure_future is None:
-                measure_future = Future()
-                if self.__use_cache:
-                    cached_result = PricingCache.get(priceable, self.market_data_location, risk_measure,
-                                                     self.pricing_date)
-                    if cached_result:
-                        measure_future.set_result(cached_result)
+                if measure_future is None:
+                    measure_future = PricingFuture(self)
+                    if self.__use_cache:
+                        cached_result = PricingCache.get(priceable, risk_measure)
+                        if cached_result:
+                            measure_future.set_result(cached_result)
 
-                if not measure_future.done():
-                    self.__risk_measures_by_provider_and_position.setdefault(
-                        priceable.provider(), {}).setdefault(
-                        position, set()).add(measure)
-                    self.__futures.setdefault(measure, {})[position] = measure_future
+                    if not measure_future.done():
+                        self.__risk_measures_in_scenario_by_provider_and_position.setdefault(
+                            priceable.provider(), {}).setdefault(
+                            position, {}).setdefault(scenario, set()).add(measure)
+                        self.__futures.setdefault((scenario, measure), {})[position] = measure_future
 
-            futures[measure] = measure_future
+                futures[measure] = measure_future
 
-        future = MultipleRiskMeasureFuture(futures) if multiple_measures else futures[risk_measure]
+        future = MultipleRiskMeasureFuture(futures, result_future=PricingFuture(self)) if multiple_measures else\
+            futures[risk_measure]
 
-        if not (self._is_entered or self.__is_async):
+        if not (self.is_entered or self.__is_async):
             if not future.done():
                 self._calc()
 
@@ -367,71 +471,29 @@ class PricingContext(ContextBaseWithDefault):
 
         fixed_rate is now the solved value
         """
-        # TODO Handle these correctly in the risk service
-        invalid_defaults = ('-- N/A --', 'NaN')
-        value_mappings = {'Payer': 'Pay', 'Rec': 'Receive', 'Receiver': 'Receive'}
+        resolution_key = self.pricing_key
 
-        def apply_field_values(
-            field_values: Union[dict, list, tuple, Future],
-            priceable_inst: Priceable,
-            resolution_info: dict,
-            future: Optional[Future] = None
-        ):
-            if isinstance(field_values, str):
-                raise RuntimeError(field_values)
-
-            if isinstance(field_values, Future):
-                field_values = field_values.result()
-
-            if isinstance(field_values, (list, tuple)):
-                if len(field_values) == 1:
-                    field_values = field_values[0]
-                else:
-                    future.set_result(
-                        {dt.date.fromtimestamp(fv['date'] / 1e9): apply_field_values(fv, priceable_inst)
-                         for fv in field_values})
-                    return
-
-            field_values = {field: value_mappings.get(value, value) for field, value in field_values.items()
-                            if inflection.underscore(field) in priceable_inst.properties() and value not in invalid_defaults}
-
-            if in_place and not future:
-                priceable_inst.unresolved = copy.copy(priceable_inst)
-                for field, value in field_values.items():
-                    setattr(priceable_inst, field, value)
-
-                priceable_inst._resolution_info = resolution_info
-            else:
-                new_inst = priceable_inst._from_dict(field_values)
-                new_inst.unresolved = priceable_inst
-                new_inst._resolution_info = resolution_info
-
-                if future:
-                    future.set_result(new_inst)
-                else:
-                    return new_inst
-
-        resolution_info = {
-            'pricing_date': self.pricing_date,
-            'market_data_as_of': self.market_data_as_of,
-            'market_data_location': self.market_data_location}
-
-        if priceable._resolution_info:
+        if priceable.resolution_key:
             if in_place:
-                if resolution_info != priceable._resolution_info:
-                    _logger.warning('Calling resolve() on an instrument which was already resolved under a difference PricingContext')
+                if resolution_key != priceable.resolution_key:
+                    _logger.warning(
+                        'Calling resolve() on an instrument already resolved under a different PricingContext')
 
                 return
-            elif resolution_info == priceable._resolution_info:
+            elif resolution_key == priceable.resolution_key:
                 return copy.copy(priceable)
 
-        res = self.calc(priceable, RiskMeasure(measure_type='Resolved Instrument Values'))
-        if isinstance(res, Future):
-            ret = Future() if not in_place else None
-            res.add_done_callback(functools.partial(apply_field_values,
-                                                    priceable_inst=priceable,
-                                                    resolution_info=resolution_info,
-                                                    future=ret))
-            return ret
-        else:
-            return apply_field_values(res, priceable, resolution_info)
+        result = self.calc(priceable, ResolvedInstrumentValues)
+        if in_place:
+            def handle_result(result_):
+                priceable.unresolved = copy.copy(priceable)
+                priceable.from_instance(result_)
+                priceable.resolution_key = result_.resolution_key
+
+            if isinstance(result, Future):
+                result.add_done_callback(lambda f: handle_result(f.result()))
+            else:
+                handle_result(result)
+                return
+
+        return result

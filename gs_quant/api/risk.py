@@ -14,9 +14,14 @@ specific language governing permissions and limitations
 under the License.
 """
 from abc import ABCMeta, abstractmethod
-from typing import Iterable, Union
+import logging
+from typing import Iterable, Mapping, Union
 
-from gs_quant.risk import Formatters, RiskRequest
+from gs_quant.base import PricingKey
+from gs_quant.risk import ErrorValue, Formatters, RiskRequest
+
+
+_logger = logging.getLogger(__name__)
 
 
 class RiskApi(metaclass=ABCMeta):
@@ -28,19 +33,33 @@ class RiskApi(metaclass=ABCMeta):
 
     @classmethod
     @abstractmethod
-    def get_results(cls, risk_request: RiskRequest, result_id: str) -> dict:
+    def get_results(cls, ids_to_requests: Mapping[str, RiskRequest]) -> Mapping[str, dict]:
         raise NotImplementedError('Must implement get_results')
 
     @classmethod
     def _handle_results(cls, request: RiskRequest, results: Iterable) -> dict:
         formatted_results = {}
 
+        pricing_key = PricingKey(
+            request.pricing_and_market_data_as_of,
+            request.pricing_location.value,
+            request.parameters,
+            request.scenario
+        )
+
         for measure_idx, position_results in enumerate(results):
             risk_measure = request.measures[measure_idx]
             formatter = Formatters.get(risk_measure)
             for position_idx, result in enumerate(position_results):
                 position = request.positions[position_idx]
-                result = formatter(result) if formatter else result
+
+                try:
+                    result = formatter(result, pricing_key, position.instrument) if formatter else result
+                except Exception as e:
+                    error_string = str(e)
+                    result = ErrorValue(pricing_key, error_string)
+                    _logger.error(error_string)
+
                 formatted_results.setdefault(risk_measure, {})[position] = result
 
         return formatted_results

@@ -13,37 +13,18 @@ KIND, either express or implied.  See the License for the
 specific language governing permissions and limitations
 under the License.
 """
-from gs_quant.base import Priceable
+from gs_quant.base import Priceable, PricingKey
 from gs_quant.markets import PricingCache, PricingContext
-from gs_quant.risk import DollarPrice, Price, RiskMeasure
+from gs_quant.risk import DataFrameWithInfo, DollarPrice, ErrorValue, FloatWithInfo, Price, RiskMeasure, SeriesWithInfo
+from gs_quant.risk.results import MultipleRiskMeasureFuture
+
 from gs_quant.session import GsSession
 
 from abc import ABCMeta
 from concurrent.futures import Future
-import pandas as pd
-from typing import Iterable, Optional, Tuple, Union
-
+from typing import Iterable, Optional, Union
 
 __asset_class_and_type_to_instrument = {}
-
-
-class RiskResult:
-
-    def __init__(self, result, risk_measures: Iterable[RiskMeasure]):
-        self.__risk_measures = tuple(risk_measures)
-        self.__result = result
-
-    @property
-    def done(self) -> bool:
-        return self.__result.done()
-
-    @property
-    def risk_measures(self) -> Tuple[RiskMeasure]:
-        return self.__risk_measures
-
-    @property
-    def _result(self):
-        return self.__result
 
 
 class PriceableImpl(Priceable, metaclass=ABCMeta):
@@ -54,14 +35,14 @@ class PriceableImpl(Priceable, metaclass=ABCMeta):
 
     def __init__(self):
         super().__init__()
-        self._resolution_info: dict = None
+        self.resolution_key: PricingKey = None
         self.unresolved: Priceable = None
 
     def __getattribute__(self, name):
         resolved = False
 
         try:
-            resolved = super().__getattribute__('_resolution_info') is not None
+            resolved = super().__getattribute__('resolution_key') is not None
         except AttributeError:
             pass
 
@@ -77,7 +58,11 @@ class PriceableImpl(Priceable, metaclass=ABCMeta):
             PricingCache.drop(self)
 
         super()._property_changed(prop)
-        self._resolution_info = None
+
+        if self.resolution_key and self.unresolved:
+            self.resolution_key = None
+            self.from_instance(self.unresolved)
+            self.unresolved = None
 
     def get_quantity(self) -> float:
         """
@@ -105,7 +90,7 @@ class PriceableImpl(Priceable, metaclass=ABCMeta):
         """
         return PricingContext.current.resolve_fields(self, in_place)
 
-    def dollar_price(self) -> Union[float, Future, RiskResult]:
+    def dollar_price(self) -> Union[FloatWithInfo, Future, SeriesWithInfo]:
         """
         Present value in USD
 
@@ -123,7 +108,7 @@ class PriceableImpl(Priceable, metaclass=ABCMeta):
         >>> cap_usd = IRCap('1y', 'USD')
         >>> cap_eur = IRCap('1y', 'EUR')
         >>>
-        >>> from gs_quant.risk import PricingContext
+        >>> from gs_quant.markets import PricingContext
         >>>
         >>> with PricingContext():
         >>>     price_usd_f = cap_usd.dollar_price()
@@ -136,7 +121,7 @@ class PriceableImpl(Priceable, metaclass=ABCMeta):
         """
         return self.calc(DollarPrice)
 
-    def price(self) -> Union[float, Future, RiskResult]:
+    def price(self) -> Union[FloatWithInfo, Future, SeriesWithInfo]:
         """
         Present value in local currency. Note that this is not yet supported on all instruments
 
@@ -152,7 +137,8 @@ class PriceableImpl(Priceable, metaclass=ABCMeta):
         return self.calc(Price)
 
     def calc(self, risk_measure: Union[RiskMeasure, Iterable[RiskMeasure]])\
-            -> Union[dict, float, str, pd.DataFrame, Future, RiskResult]:
+            -> Union[list, DataFrameWithInfo, ErrorValue, FloatWithInfo, Future, MultipleRiskMeasureFuture,
+                     SeriesWithInfo]:
         """
         Calculate the value of the risk_measure
 
@@ -178,7 +164,7 @@ class PriceableImpl(Priceable, metaclass=ABCMeta):
 
         delta is a float
 
-        >>> from gs_quant.risk import PricingContext
+        >>> from gs_quant.markets import PricingContext
         >>>
         >>> cap_usd = IRCap('1y', 'USD')
         >>> cap_eur = IRCap('1y', 'EUR')

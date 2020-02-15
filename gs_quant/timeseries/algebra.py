@@ -554,6 +554,7 @@ def filter_(x: pd.Series, operator: Optional[FilterOperator] = None, value: Opti
     """
     Removes values where comparison with the operator and value combination results in true, defaults to removing
     missing values from the series
+
     :param x: timeseries
     :param operator: FilterOperator describing logic for value removal, e.g 'less_than'
     :param value: number indicating value(s) to remove from the series
@@ -606,3 +607,23 @@ def filter_(x: pd.Series, operator: Optional[FilterOperator] = None, value: Opti
             raise MqValueError('Unexpected operator: ' + operator)
         x = x.drop(x[remove].index)
     return x
+
+
+@plot_function
+def repeat(x: pd.Series, n: int = 1) -> pd.Series:
+    """
+    Repeats values for days where data is missing. For any date with missing data, the last recorded value is used.
+    Optionally downsamples the result such that there are data points every n days.
+
+    :param x: date-based timeseries
+    :param n: desired frequency of output
+    :return: a timeseries that has been forward-filled, and optionally downsampled
+
+    **Usage**
+
+    Fill missing values with last seen value e.g. to combine daily with weekly or monthly data.
+    """
+    if not 0 < n < 367:
+        raise MqValueError('n must be between 0 and 367')
+    index = pd.date_range(freq=f'{n}D', start=x.index[0], end=x.index[-1])
+    return x.reindex(index, method='ffill')
